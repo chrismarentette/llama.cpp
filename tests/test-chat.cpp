@@ -1087,6 +1087,7 @@ struct peg_test_case {
     common_chat_msg              expect;
     bool                         is_partial            = false;
     bool                         expect_reconstruction = false;
+    bool                         test_grammar          = true;
 };
 
 struct make_peg_parser {
@@ -1379,7 +1380,7 @@ static void test_peg_parser(common_chat_templates *                      tmpls,
         }
 
         // Test the constrained portion against the grammar
-        if (grammar_triggered && !tc.is_partial) {
+        if (tc.test_grammar && grammar_triggered && !tc.is_partial) {
             auto result = match_string_detailed(constrained, grammar.get());
             if (!result.success) {
                 std::string error_msg;
@@ -1534,6 +1535,10 @@ class peg_test_builder {
 
     peg_test_builder & expect_reconstruction(bool val = true) {
         tc_.expect_reconstruction = val;
+        return *this;
+    }
+    peg_test_builder & test_grammar(bool val) {
+        tc_.test_grammar = val;
         return *this;
     }
 
@@ -3620,6 +3625,143 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .tools({ special_function_tool })
             .expect(message_assist_call)
             .run();
+
+        // UnbiasedStrata: unconstrained Qwen3.8 Flash-Next writes Python-capitalized booleans/None
+        // (`True`/`False`/`None`), undeclared/alias parameter names (e.g. `notify_on_complete`), and
+        // occasionally malformed JSON inside non-string parameters. All must parse cleanly without
+        // collapsing the streamed tool call.
+        {
+            common_chat_tool terminal_like_tool {
+                /* .name = */ "terminal",
+                /* .description = */ "Run shell command",
+                /* .parameters = */ R"({
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "background": {"type": "boolean"},
+                        "notify": {"anyOf": [{"type": "boolean"}, {"type": "array", "items": {"type": "string"}}]},
+                        "metadata": {"type": "object"}
+                    },
+                    "required": ["command"]
+                })",
+            };
+
+            // Python True/False on boolean + anyOf[boolean, array] parameters
+            tst.test(
+                   "<tool_call>\n"
+                   "<function=terminal>\n"
+                   "<parameter=command>\n"
+                   "cargo test\n"
+                   "</parameter>\n"
+                   "<parameter=background>\n"
+                   "True\n"
+                   "</parameter>\n"
+                   "<parameter=notify>\n"
+                   "False\n"
+                   "</parameter>\n"
+                   "</function>\n"
+                   "</tool_call>")
+                .tools({ terminal_like_tool })
+                .expect_tool_calls({
+                    { "terminal", R"({"command": "cargo test", "background": true, "notify": false})", {} },
+                })
+                .test_grammar(false)
+                .run();
+
+            // Python literals inside an object parameter (True/False/None + single quotes)
+            tst.test(
+                   "<tool_call>\n"
+                   "<function=terminal>\n"
+                   "<parameter=command>\n"
+                   "ls\n"
+                   "</parameter>\n"
+                   "<parameter=metadata>\n"
+                   "{'ok': True, 'err': None, 'dry': False}\n"
+                   "</parameter>\n"
+                   "</function>\n"
+                   "</tool_call>")
+                .tools({ terminal_like_tool })
+                .expect_tool_calls({
+                    { "terminal", R"({"command": "ls", "metadata": {"ok": true, "err": null, "dry": false}})", {} },
+                })
+                .test_grammar(false)
+                .run();
+
+            // Undeclared / alias parameters (both Python bool and raw string values)
+            tst.test(
+                   "<tool_call>\n"
+                   "<function=terminal>\n"
+                   "<parameter=command>\n"
+                   "cargo test\n"
+                   "</parameter>\n"
+                   "<parameter=background>\n"
+                   "True\n"
+                   "</parameter>\n"
+                   "<parameter=notify_on_complete>\n"
+                   "True\n"
+                   "</parameter>\n"
+                   "<parameter=extra_note>\n"
+                   "keep going\n"
+                   "</parameter>\n"
+                   "</function>\n"
+                   "</tool_call>")
+                .tools({ terminal_like_tool })
+                .expect_tool_calls({
+                    { "terminal", R"({"command": "cargo test", "background": true, "notify_on_complete": true, "extra_note": "keep going"})", {} },
+                })
+                .test_grammar(false)
+                .run();
+
+            // Malformed JSON inside a declared object parameter falls back to a raw string
+            tst.test(
+                   "<tool_call>\n"
+                   "<function=terminal>\n"
+                   "<parameter=command>\n"
+                   "ls\n"
+                   "</parameter>\n"
+                   "<parameter=metadata>\n"
+                   "{\"a\": 1}, \"extra\": 2}\n"
+                   "</parameter>\n"
+                   "</function>\n"
+                   "</tool_call>")
+                .tools({ terminal_like_tool })
+                .expect_tool_calls({
+                    { "terminal", R"({"command": "ls", "metadata": "{\"a\": 1}, \"extra\": 2}"})", {} },
+                })
+                .test_grammar(false)
+                .run();
+
+            // Parallel tool calls where the second call uses Python True + alias parameter
+            tst.test(
+                   "<tool_call>\n"
+                   "<function=special_function>\n"
+                   "<parameter=arg1>\n"
+                   "1\n"
+                   "</parameter>\n"
+                   "</function>\n"
+                   "</tool_call>\n"
+                   "<tool_call>\n"
+                   "<function=terminal>\n"
+                   "<parameter=background>\n"
+                   "True\n"
+                   "</parameter>\n"
+                   "<parameter=command>\n"
+                   "echo ok\n"
+                   "</parameter>\n"
+                   "<parameter=notify_on_complete>\n"
+                   "True\n"
+                   "</parameter>\n"
+                   "</function>\n"
+                   "</tool_call>")
+                .parallel_tool_calls(true)
+                .tools({ special_function_tool, terminal_like_tool })
+                .expect_tool_calls({
+                    { "special_function", R"({"arg1": 1})", {} },
+                    { "terminal", R"({"background": true, "command": "echo ok", "notify_on_complete": true})", {} },
+                })
+                .test_grammar(false)
+                .run();
+        }
 
         // Some models skip the opening <tool_call> and go straight to <function=>
         tst.test(

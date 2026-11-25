@@ -1,5 +1,7 @@
 #include "parsers.h"
 
+#include <cctype>
+
 common_chat_params common_chat_params_init_qwen3_coder(const common_chat_template &          tmpl,
                                                               const autoparser::generation_params & inputs) {
     common_chat_params data;
@@ -92,6 +94,54 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
             auto arg_string = p.rule("xml-arg-string",
                 p.ac(p.tool_arg_string_value(p.until("\n</parameter>\n")) + arg_close, "\n</parameter>\n"));
 
+            auto sanitize_rule_name = [](const std::string & s) {
+                std::string out;
+                out.reserve(s.size());
+                bool in_bad = false;
+                for (unsigned char c : s) {
+                    if (std::isalnum(c) || c == '-') {
+                        out.push_back(static_cast<char>(c));
+                        in_bad = false;
+                    } else if (!in_bad) {
+                        out.push_back('-');
+                        in_bad = true;
+                    }
+                }
+                return out;
+            };
+
+            // UnbiasedStrata: without grammar-constrained sampling, Qwen3.8 Flash-Next writes Python literals
+            // (True/False/None, single-quoted keys/strings) inside non-string XML parameters.
+            // common_chat_peg_mapper::normalize_container_value() already converts them to valid JSON
+            // monotonically during partial streaming. Unlike python_or_json_value(), this keeps json()'s exact
+            // whitespace (no trailing ws that would swallow arg_close's leading '\n').
+            auto json_or_python = p.rule("qwen3-json-or-python-value", [&]() {
+                auto ws    = p.space();
+                auto value = p.ref("qwen3-json-or-python-value");
+
+                auto member  = p.sequence({ p.quoted_string(), ws, p.literal(":"), ws, value });
+                auto members = p.sequence({ member, p.zero_or_more(p.sequence({ ws, p.literal(","), ws, member })) });
+                auto obj     = p.rule("qwen3-json-or-python-object", [&]() {
+                    return p.sequence({ p.literal("{"), ws, p.choice({ p.literal("}"), p.sequence({ members, ws, p.literal("}") }) }) });
+                });
+
+                auto elements = p.sequence({ value, p.zero_or_more(p.sequence({ ws, p.literal(","), ws, value })) });
+                auto arr      = p.rule("qwen3-json-or-python-array", [&]() {
+                    return p.sequence({ p.literal("["), ws, p.choice({ p.literal("]"), p.sequence({ elements, ws, p.literal("]") }) }) });
+                });
+
+                return p.choice({ obj, arr, p.quoted_string(), p.json_number(),
+                                  p.json_bool(), p.json_null(), p.python_bool(), p.python_null() });
+            });
+
+            // UnbiasedStrata: unconstrained models also emit undeclared or alias parameter names
+            // (e.g. notify_on_complete, actions, assignee2). Match them after all declared args so the
+            // tool call stays valid JSON instead of dropping mid-stream (1->0 tool calls).
+            auto unknown_arg_open  = p.tool_arg_open(
+                p.literal("<parameter=") + p.tool_arg_name(p.chars("[^>\\n]", 1, -1)) + p.literal(">\n"));
+            auto unknown_arg_value = p.atomic(p.tool_arg_json_value(json_or_python) + arg_close) | arg_string;
+            auto unknown_arg       = p.tool_arg(unknown_arg_open + unknown_arg_value);
+
             auto tool_choice = p.choice();
             foreach_function(inputs.tools, [&](const json & tool) {
                 const auto & function = tool.at("function");
@@ -109,7 +159,13 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
 
                     auto arg_value = p.eps();
                     if (!types.has(common_chat_schema::TYPE_STRING)) {
-                        arg_value = p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", doc, *param.schema)) + arg_close;
+                        // Parse JSON or Python literals cleanly; fall back to raw string on malformed JSON
+                        // so a single syntax slip surfaces to the client's schema validator instead of
+                        // truncating the streamed tool call mid-JSON. GBNF stays bound to the strict schema.
+                        auto typed_rule_name = sanitize_rule_name(rule_name + "-typed");
+                        auto typed_arg = p.rule(typed_rule_name,
+                            p.tool_arg_json_value(p.schema(json_or_python, rule_name + "-schema", doc, *param.schema)) + arg_close);
+                        arg_value = p.gbnf(p.atomic(typed_arg) | arg_string, typed_rule_name);
                     } else if (types.is_only(common_chat_schema::TYPE_STRING)) {
                         arg_value = arg_string;
                     } else {
@@ -126,10 +182,10 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
                             json_value |= p.json_number();
                         }
                         if (types.has(common_chat_schema::TYPE_BOOLEAN)) {
-                            json_value |= p.json_bool();
+                            json_value |= p.json_bool() | p.python_bool();
                         }
                         if (types.has(common_chat_schema::TYPE_NULL)) {
-                            json_value |= p.json_null();
+                            json_value |= p.json_null() | p.python_null();
                         }
                         arg_value = p.gbnf(p.atomic(p.tool_arg_json_value(json_value) + arg_close) | arg_string, "xml-arg-string");
                     }
@@ -158,7 +214,12 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
                 auto stray_close = p.negate(p.literal("</function>")) + p.negate(p.literal("</tool_call>")) +
                                    p.literal("</") + p.chars("[a-zA-Z_]") + p.literal(">\n");
                 auto blank_line  = p.literal("\n");
-                auto args = all_args.empty() ? p.eps() : p.zero_or_more(p.choice(all_args) | stray_close | blank_line);
+                auto declared_args_name = sanitize_rule_name("tool-" + name + "-declared-args");
+                auto args = all_args.empty()
+                    ? p.gbnf(p.zero_or_more(unknown_arg | stray_close | blank_line), "\"\"")
+                    : p.zero_or_more(
+                        p.gbnf(p.rule(declared_args_name, p.choice(all_args)) | unknown_arg, declared_args_name) |
+                        stray_close | blank_line);
 
                 auto func = p.tool(p.tool_open("<function=" + p.tool_name(p.literal(name)) + ">\n") +
                                    p.tool_args(args) +
